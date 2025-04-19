@@ -1,12 +1,16 @@
 # pylint: disable=line-too-long,too-many-lines,missing-docstring
 import os
 import warnings
-
+import cv2
+from collections import deque
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torch.nn import functional as F
+import torchvision.models as models
+from torchvision.models import MobileNet_V2_Weights
 
 from . import video_transforms, volume_transforms
 from .loader import get_image_loader, get_video_loader
@@ -51,6 +55,9 @@ class VideoClsDataset(Dataset):
         self.args = args
         self.aug = False
         self.rand_erase = False
+        self.feature_cache = {}  # 用于缓存特征
+        self.feature_extractor = None  # 延迟加载特征提取器
+        self.device = "cpu"  # 默认使用CPU以避免CUDA问题
 
         if self.mode in ['train']:
             self.aug = True
@@ -97,6 +104,340 @@ class VideoClsDataset(Dataset):
                         self.test_label_array.append(sample_label)
                         self.test_dataset.append(self.dataset_samples[idx])
                         self.test_seg.append((ck, cp))
+
+    @staticmethod
+    def _get_feature_extractor():
+        """使用最新API加载特征提取器"""
+        # 使用新API加载预训练模型
+        model = models.mobilenet_v2(weights=MobileNet_V2_Weights.IMAGENET1K_V1)
+        # 只保留特征提取部分
+        feature_extractor = torch.nn.Sequential(*list(model.children())[:-1])
+        feature_extractor.eval()
+        return feature_extractor
+
+    def _ensure_extractor_loaded(self):
+        """确保特征提取器已加载（延迟加载）"""
+        if self.feature_extractor is None:
+            self.feature_extractor = self._get_feature_extractor()
+            # 固定在CPU上以避免CUDA多进程问题
+            self.feature_extractor = self.feature_extractor.to(self.device)
+
+    def _compute_attention_weights(self, features):
+        """计算特征的自注意力权重"""
+        # 计算特征之间的相似度矩阵(使用余弦相似度更稳定)
+        features_norm = F.normalize(features, p=2, dim=1)
+        similarity = torch.matmul(features_norm, features_norm.transpose(0, 1))
+
+        # 应用softmax获取注意力权重
+        attention_weights = F.softmax(similarity, dim=-1)
+
+        # 计算全局注意力得分 (对每行求和)
+        attention_scores = attention_weights.sum(dim=1)
+
+        return attention_scores
+
+    def _diversity_sampling(self, features, weights, max_frames):
+        """基于多样性的帧采样"""
+        if len(features) <= max_frames:
+            return list(range(len(features)))
+
+        selected_indices = []
+        remaining_indices = list(range(len(features)))
+
+        # 选择权重最高的帧作为第一帧
+        first_idx = weights.argmax().item()
+        selected_indices.append(first_idx)
+        remaining_indices.remove(first_idx)
+
+        # 迭代选择剩余帧
+        while len(selected_indices) < max_frames and remaining_indices:
+            best_idx = -1
+            best_score = -float('inf')
+
+            # 计算每个剩余帧与已选帧的最小距离
+            for idx in remaining_indices:
+                min_dist = float('inf')
+                for sel_idx in selected_indices:
+                    dist = torch.norm(features[idx] - features[sel_idx], p=2).item()
+                    min_dist = min(min_dist, dist)
+
+                # 结合注意力权重和多样性得分
+                diversity_score = min_dist
+                attention_score = weights[idx].item()
+                # 平衡注意力与多样性
+                combined_score = attention_score * 0.7 + diversity_score * 0.3
+
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_idx = idx
+
+            if best_idx != -1:
+                selected_indices.append(best_idx)
+                remaining_indices.remove(best_idx)
+            else:
+                break
+
+        return sorted(selected_indices)
+
+    def detect_keyframes(self, vr, max_frames=10, threshold=0.15, mode='hmdb51_optimized'):
+        """检测视频中的关键帧"""
+        length = len(vr)
+        if length <= max_frames:
+            return list(range(length))
+
+        # 使用注意力机制的动态关键帧选择
+        if mode == 'attention_based':
+            try:
+                # 获取均匀采样的候选帧
+                num_candidates = min(30, length)
+                step = length / num_candidates
+                candidate_indices = [min(length - 1, int(i * step)) for i in range(num_candidates)]
+
+                # 获取候选帧
+                frames = vr.get_batch(candidate_indices).asnumpy()
+
+                # 使用CPU处理以避免CUDA问题
+                self.device = "cpu"
+                self._ensure_extractor_loaded()
+
+                # 预处理帧并提取特征
+                batch_frames = []
+                for frame in frames:
+                    # 预处理
+                    img = cv2.resize(frame, (224, 224))
+                    img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+                    img = torch.unsqueeze(img, 0)
+                    # 归一化
+                    img = (img - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)) / \
+                          torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                    batch_frames.append(img)
+
+                with torch.no_grad():
+                    # 批量提取特征
+                    features = []
+                    for img in batch_frames:
+                        img = img.to(self.device)
+                        feat = self.feature_extractor(img)
+                        feat = feat.squeeze().cpu()
+                        features.append(feat)
+
+                    features = torch.stack(features)
+                    features_flat = features.view(features.size(0), -1)
+
+                    # 计算注意力权重
+                    attention_weights = self._compute_attention_weights(features_flat)
+
+                    # 基于注意力权重和多样性采样选择最终关键帧
+                    selected_indices = self._diversity_sampling(
+                        features_flat,
+                        attention_weights,
+                        max_frames
+                    )
+
+                    # 将选择的索引映射回原始帧索引
+                    final_indices = [candidate_indices[idx] for idx in selected_indices]
+
+                    return sorted(final_indices)
+            except Exception as e:
+                print(f"注意力关键帧检测失败，使用默认方法: {str(e)}")
+                # 如果出错，回退到默认方法
+                mode = 'hmdb51_optimized'
+
+        # 其他现有的关键帧提取方法保持不变
+        elif mode == 'hmdb51_optimized':
+            # 原有的实现...
+            frame_diffs = []
+            prev_frame = None
+
+            sample_indices = np.linspace(0, length-1, min(100, length)).astype(int)
+            frames = vr.get_batch(sample_indices).asnumpy()
+
+            for i in range(1, len(frames)):
+                curr_frame = frames[i]
+                if prev_frame is not None:
+                    curr_gray = np.mean(curr_frame, axis=2)
+                    prev_gray = np.mean(prev_frame, axis=2)
+
+                    diff = np.mean(np.abs(curr_gray - prev_gray))
+                    frame_diffs.append((sample_indices[i], diff))
+                prev_frame = curr_frame
+
+            keyframe_indices = [0]
+            sorted_diffs = sorted(frame_diffs, key=lambda x: x[1], reverse=True)
+
+            for idx, diff in sorted_diffs:
+                if diff >= threshold and idx not in keyframe_indices:
+                    keyframe_indices.append(idx)
+                if len(keyframe_indices) >= max_frames:
+                    break
+
+            if len(keyframe_indices) < max_frames:
+                remaining_indices = [i for i in range(length) if i not in keyframe_indices]
+                step = len(remaining_indices) // (max_frames - len(keyframe_indices))
+                if step > 0:
+                    additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
+                    keyframe_indices.extend(additional_indices)
+
+            return sorted(keyframe_indices[:max_frames])
+
+        elif mode == 'optical_flow':
+            sample_indices = np.linspace(0, length-1, min(100, length)).astype(int)
+            frames = vr.get_batch(sample_indices).asnumpy()
+
+            flow_magnitudes = []
+            prev_frame_gray = None
+
+            for i in range(len(frames)):
+                curr_frame = frames[i]
+                curr_frame_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+
+                if prev_frame_gray is not None:
+                    flow = cv2.calcOpticalFlowFarneback(
+                        prev_frame_gray, curr_frame_gray, None,
+                        0.5, 3, 15, 3, 5, 1.2, 0
+                    )
+                    magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                    mean_magnitude = np.mean(magnitude)
+                    flow_magnitudes.append((sample_indices[i], mean_magnitude))
+
+                prev_frame_gray = curr_frame_gray
+
+            flow_magnitudes.sort(key=lambda x: x[1], reverse=True)
+            keyframe_indices = [0]
+
+            for idx, _ in flow_magnitudes:
+                if idx not in keyframe_indices:
+                    keyframe_indices.append(idx)
+                if len(keyframe_indices) >= max_frames:
+                    break
+
+            return sorted(keyframe_indices[:max_frames])
+
+        elif mode == 'scene_change':
+            sample_indices = np.linspace(0, length-1, min(100, length)).astype(int)
+            frames = vr.get_batch(sample_indices).asnumpy()
+
+            scene_changes = []
+            prev_hist = None
+
+            for i in range(len(frames)):
+                curr_frame = frames[i]
+                hsv = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+
+                if prev_hist is not None:
+                    diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                    scene_changes.append((sample_indices[i], 1 - diff))
+
+                prev_hist = hist
+
+            scene_changes.sort(key=lambda x: x[1], reverse=True)
+            keyframe_indices = [0]
+
+            for idx, diff in scene_changes:
+                if diff > threshold and idx not in keyframe_indices:
+                    keyframe_indices.append(idx)
+                if len(keyframe_indices) >= max_frames:
+                    break
+
+            if len(keyframe_indices) < max_frames:
+                remaining_indices = [i for i in range(length) if i not in keyframe_indices]
+                step = len(remaining_indices) // (max_frames - len(keyframe_indices))
+                if step > 0:
+                    additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
+                    keyframe_indices.extend(additional_indices)
+
+            return sorted(keyframe_indices[:max_frames])
+
+        elif mode == 'content_aware':
+            sample_indices = np.linspace(0, length-1, min(100, length)).astype(int)
+            frames = vr.get_batch(sample_indices).asnumpy()
+
+            frame_scores = []
+            prev_frame = None
+            prev_gray = None
+
+            for i in range(len(frames)):
+                curr_frame = frames[i]
+                curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
+
+                clarity = cv2.Laplacian(curr_gray, cv2.CV_64F).var()
+                brightness = np.mean(curr_gray)
+                contrast = np.std(curr_gray)
+
+                motion_score = 0
+                if prev_gray is not None:
+                    diff = np.abs(curr_gray - prev_gray)
+                    motion_score = np.mean(diff)
+
+                    if prev_frame is not None and i % 5 == 0:
+                        flow = cv2.calcOpticalFlowFarneback(
+                            prev_gray, curr_gray, None,
+                            0.5, 3, 15, 3, 5, 1.2, 0
+                        )
+                        magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                        motion_score = max(motion_score, np.mean(magnitude))
+
+                score = clarity * 0.4 + contrast * 0.3 + motion_score * 0.3
+                frame_scores.append((sample_indices[i], score))
+
+                prev_frame = curr_frame
+                prev_gray = curr_gray
+
+            frame_scores.sort(key=lambda x: x[1], reverse=True)
+            keyframe_indices = [0]
+            last_selected = 0
+            min_interval = length // (max_frames * 2)
+
+            for idx, _ in frame_scores:
+                if idx not in keyframe_indices and (idx - last_selected) > min_interval:
+                    keyframe_indices.append(idx)
+                    last_selected = idx
+                if len(keyframe_indices) >= max_frames:
+                    break
+
+            if len(keyframe_indices) < max_frames:
+                remaining_indices = [i for i in range(length) if i not in keyframe_indices]
+                step = len(remaining_indices) // (max_frames - len(keyframe_indices))
+                if step > 0:
+                    additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
+                    keyframe_indices.extend(additional_indices)
+
+            return sorted(keyframe_indices[:max_frames])
+
+        elif mode == 'uniform':
+            return list(np.linspace(0, length-1, max_frames).astype(int))
+
+        elif mode == 'saliency_map':
+            sample_indices = np.linspace(0, length-1, min(100, length)).astype(int)
+            frames = vr.get_batch(sample_indices).asnumpy()
+
+            saliency_scores = []
+            saliency_detector = cv2.saliency.StaticSaliencySpectralResidual_create()
+
+            for i in range(len(frames)):
+                curr_frame = frames[i]
+                curr_frame_bgr = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2BGR)
+
+                success, saliency_map = saliency_detector.computeSaliency(curr_frame_bgr)
+                if success:
+                    score = np.mean(saliency_map)
+                    saliency_scores.append((sample_indices[i], score))
+
+            saliency_scores.sort(key=lambda x: x[1], reverse=True)
+            keyframe_indices = [0]
+
+            for idx, _ in saliency_scores:
+                if idx not in keyframe_indices:
+                    keyframe_indices.append(idx)
+                if len(keyframe_indices) >= max_frames:
+                    break
+
+            return sorted(keyframe_indices[:max_frames])
+
+        else:
+            return list(np.linspace(0, length-1, max_frames).astype(int))
 
     def __getitem__(self, index):
         if self.mode == 'train':
@@ -268,7 +609,29 @@ class VideoClsDataset(Dataset):
 
         length = len(vr)
 
+        # 检查是否启用了关键帧模式
+        use_keyframes = hasattr(self.args, 'keyframe_mode') and self.args.keyframe_mode
+
         if self.mode == 'test':
+            # 测试模式下，如果启用了关键帧且在评估状态，使用关键帧
+            if use_keyframes and self.args.eval:
+                all_index = self.detect_keyframes(
+                    vr, 
+                    max_frames=self.args.keyframe_max_frames,
+                    threshold=self.args.keyframe_threshold,
+                    mode=self.args.keyframe_mode
+                )
+                
+                # 确保有足够的帧
+                if len(all_index) < self.clip_len:
+                    additional_indices = [i for i in range(length) if i not in all_index]
+                    all_index.extend(additional_indices[:self.clip_len - len(all_index)])
+                
+                vr.seek(0)
+                buffer = vr.get_batch(all_index).asnumpy()
+                return buffer
+            
+            # 原始测试模式逻辑
             if self.sparse_sample:
                 tick = length / float(self.num_segment)
                 all_index = []
@@ -290,6 +653,31 @@ class VideoClsDataset(Dataset):
             buffer = vr.get_batch(all_index).asnumpy()
             return buffer
 
+        # 训练或验证模式下，如果启用了关键帧，也使用关键帧
+        if use_keyframes:
+            all_index = self.detect_keyframes(
+                vr, 
+                max_frames=self.args.keyframe_max_frames,
+                threshold=self.args.keyframe_threshold,
+                mode=self.args.keyframe_mode
+            )
+            
+            # 确保有足够的帧
+            if len(all_index) < self.clip_len:
+                additional_indices = [i for i in range(length) if i not in all_index]
+                all_index.extend(additional_indices[:self.clip_len - len(all_index)])
+            
+            # 如果帧太多，取子集
+            if len(all_index) > self.clip_len:
+                interval = len(all_index) // self.clip_len
+                all_index = all_index[::interval][:self.clip_len]
+            
+            all_index = all_index[::int(sample_rate_scale)]
+            vr.seek(0)
+            buffer = vr.get_batch(all_index).asnumpy()
+            return buffer
+
+        # 原始训练模式逻辑
         # handle temporal segments
         converted_len = int(self.clip_len * self.frame_sample_rate)
         seg_len = length // self.num_segment

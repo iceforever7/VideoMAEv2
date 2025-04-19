@@ -25,6 +25,8 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.models import create_model
 from timm.utils import ModelEma
 
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 # NOTE: Do not comment `import models`, it is used to register models
 import models  # noqa: F401
 import utils
@@ -239,6 +241,29 @@ def get_args():
         action='store_true',
         default=False,
         help='Do not random erase first (clean) augmentation split')
+
+    # 添加关键帧相关参数
+    parser.add_argument(
+    '--keyframe_mode',
+    type=str,
+    default=None,
+    choices=[None, 'hmdb51_optimized', 'optical_flow', 'scene_change', 'content_aware', 'uniform', 'saliency_map', 'attention_based'],
+    help='Key frame extraction mode')
+    parser.add_argument(
+        '--keyframe_max_frames',
+        type=int,
+        default=10,
+        help='Maximum number of key frames to extract')
+    parser.add_argument(
+        '--keyframe_threshold',
+        type=float,
+        default=0.15,
+        help='Threshold for key frame detection')
+    parser.add_argument(
+        '--keyframe_interval',
+        type=int,
+        default=0,
+        help='Minimum interval between key frames (0 for no constraint)')
 
     # * Mixup params
     parser.add_argument(
@@ -815,6 +840,8 @@ def main(args, ds_init):
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
+        epoch_start_time = time.time()  # 记录每个epoch的开始时间
+        
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
@@ -838,6 +865,12 @@ def main(args, ds_init):
             num_training_steps_per_epoch=num_training_steps_per_epoch,
             update_freq=args.update_freq,
         )
+        
+        # 计算这个epoch的训练时间
+        epoch_time = time.time() - epoch_start_time
+        epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
+        print(f"Epoch {epoch} training time: {epoch_time_str}")
+        
         if args.output_dir and args.save_ckpt:
             _epoch = epoch + 1
             if _epoch % args.save_ckpt_freq == 0 or _epoch == args.epochs:
@@ -879,14 +912,18 @@ def main(args, ds_init):
                 **{f'train_{k}': v
                    for k, v in train_stats.items()},
                 **{f'val_{k}': v
-                   for k, v in test_stats.items()}, 'epoch': epoch,
-                'n_parameters': n_parameters
+                   for k, v in test_stats.items()}, 
+                'epoch': epoch,
+                'n_parameters': n_parameters,
+                'epoch_time': epoch_time  # 添加epoch时间到日志
             }
         else:
             log_stats = {
                 **{f'train_{k}': v
-                   for k, v in train_stats.items()}, 'epoch': epoch,
-                'n_parameters': n_parameters
+                   for k, v in train_stats.items()}, 
+                'epoch': epoch,
+                'n_parameters': n_parameters,
+                'epoch_time': epoch_time  # 添加epoch时间到日志
             }
         if args.output_dir and utils.is_main_process():
             if log_writer is not None:

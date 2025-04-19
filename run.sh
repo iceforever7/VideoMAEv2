@@ -1,0 +1,30 @@
+python run_class_finetuning.py \
+        --model vit_giant_patch14_224 \
+        --data_set HMDB51 \
+        --nb_classes 51 \
+        --data_path /root/autodl-tmp/hmdb51_org\
+        --finetune /root/autodl-tmp/vit_g_hybrid_pt_1200e_k710_ft.pth\
+        --log_dir /root/autodl-tmp/log\
+        --output_dir /root/autodl-tmp/checkpoints\
+        --batch_size 3 \
+        --num_sample 2 \
+        --input_size 224 \
+        --short_side_size 224 \
+        --save_ckpt_freq 3 \
+        --num_frames 16 \
+        --sampling_rate 2 \
+        --opt adamw \
+        --lr 5e-4 \
+        --layer_decay 0.90 \
+        --num_workers 9 \
+        --opt_betas 0.9 0.999 \
+        --weight_decay 0.05 \
+        --epochs 15 \
+        --drop_path 0.35 \
+        --head_drop_rate 0.5 \
+        --test_num_segment 5 \
+        --test_num_crop 3\
+        --dist_eval --enable_deepspeed \
+        --keyframe_mode hmdb51_optimized \
+        --keyframe_max_frames 16 \
+        --keyframe_threshold 0.2 \
