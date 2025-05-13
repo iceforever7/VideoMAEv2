@@ -58,6 +58,9 @@ class VideoClsDataset(Dataset):
         self.feature_cache = {}  # 用于缓存特征
         self.feature_extractor = None  # 延迟加载特征提取器
         self.device = "cpu"  # 默认使用CPU以避免CUDA问题
+        self.keyframe_time = 0.0  # 使用浮点型而非整型
+        self.keyframe_extraction_count = 0  # 新增：统计调用次数
+        self.total_videos_processed = 0  # 新增：统计处理的视频数
 
         if self.mode in ['train']:
             self.aug = True
@@ -179,10 +182,78 @@ class VideoClsDataset(Dataset):
 
         return sorted(selected_indices)
 
+    def _diversity_sampling_multimodal(self, visual_features, motion_features, weights, max_frames):
+        """多模态多样性帧采样"""
+        if len(visual_features) <= max_frames:
+            return list(range(len(visual_features)))
+
+        selected_indices = []
+        remaining_indices = list(range(len(visual_features)))
+
+        # 选择权重最高的帧作为第一帧
+        first_idx = weights.argmax().item()
+        selected_indices.append(first_idx)
+        remaining_indices.remove(first_idx)
+
+        # 迭代选择剩余帧
+        while len(selected_indices) < max_frames and remaining_indices:
+            best_idx = -1
+            best_score = -float('inf')
+
+            # 计算每个剩余帧与已选帧的多模态距离
+            for idx in remaining_indices:
+                # 视觉特征距离
+                min_visual_dist = float('inf')
+                for sel_idx in selected_indices:
+                    dist = torch.norm(visual_features[idx] - visual_features[sel_idx], p=2).item()
+                    min_visual_dist = min(min_visual_dist, dist)
+
+                # 运动特征差异
+                motion_diff = abs(motion_features[idx].item() -
+                                  sum(motion_features[sel_idx].item() for sel_idx in selected_indices) / len(selected_indices))
+
+                # 结合注意力权重、视觉多样性和运动差异
+                diversity_score = min_visual_dist * 0.7 + motion_diff * 0.3
+                attention_score = weights[idx].item()
+
+                # 平衡注意力与多样性 (调整权重以获得最佳结果)
+                combined_score = attention_score * 0.6 + diversity_score * 0.4
+
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_idx = idx
+
+            if best_idx != -1:
+                selected_indices.append(best_idx)
+                remaining_indices.remove(best_idx)
+            else:
+                break
+
+        return sorted(selected_indices)
+
     def detect_keyframes(self, vr, max_frames=10, threshold=0.15, mode='hmdb51_optimized'):
         """检测视频中的关键帧"""
+        import time
+        import os
+        import fcntl
+        
+        self.keyframe_extraction_count += 1  # 增加调用计数
+        process_id = os.getpid()
+        
+        # 创建统计目录
+        stats_dir = os.path.join('/tmp', 'keyframe_stats')
+        os.makedirs(stats_dir, exist_ok=True)
+        stats_file = os.path.join(stats_dir, 'keyframe_stats.txt')
+        
+        # 打印日志用于调试
+        print(f"开始关键帧提取 #{self.keyframe_extraction_count}, 模式: {mode}, 最大帧数: {max_frames}, 进程ID: {process_id}")
+        start_time = time.time()
+        
         length = len(vr)
         if length <= max_frames:
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"视频长度 {length} 小于最大帧数 {max_frames}，耗时: {elapsed:.6f}秒")
             return list(range(length))
 
         # 使用注意力机制的动态关键帧选择
@@ -237,11 +308,139 @@ class VideoClsDataset(Dataset):
                     # 将选择的索引映射回原始帧索引
                     final_indices = [candidate_indices[idx] for idx in selected_indices]
 
+                    elapsed = time.time() - start_time
+                    self.keyframe_time += elapsed
+                    print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+                    
+                    # 写入统计信息到文件（使用文件锁确保并发安全）
+                    try:
+                        with open(stats_file, 'a+') as f:
+                            fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                            f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                            fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+                    except Exception as e:
+                        print(f"无法写入统计信息: {e}")
+                    
                     return sorted(final_indices)
             except Exception as e:
                 print(f"注意力关键帧检测失败，使用默认方法: {str(e)}")
                 # 如果出错，回退到默认方法
+                elapsed = time.time() - start_time
+                self.keyframe_time += elapsed
                 mode = 'hmdb51_optimized'
+
+        elif mode == 'multimodal_attention':
+            try:
+                # 1. 获取均匀采样的候选帧和特征
+                num_candidates = min(60, length)
+                step = length / num_candidates
+                candidate_indices = [min(length - 1, int(i * step)) for i in range(num_candidates)]
+                frames = vr.get_batch(candidate_indices).asnumpy()
+
+                # 2. 使用CPU处理
+                self.device = "cpu"
+                self._ensure_extractor_loaded()
+
+                # 3. 提取多模态特征
+                visual_features = []    # 视觉特征
+                motion_features = []    # 运动特征
+                temporal_weights = []   # 时序权重
+
+                # 视觉特征提取
+                batch_frames = []
+                for frame in frames:
+                    img = cv2.resize(frame, (224, 224))
+                    img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
+                    img = torch.unsqueeze(img, 0)
+                    img = (img - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)) / \
+                          torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                    batch_frames.append(img)
+
+                # 提取视觉特征
+                with torch.no_grad():
+                    for img in batch_frames:
+                        img = img.to(self.device)
+                        feat = self.feature_extractor(img)
+                        feat = feat.squeeze().cpu()
+                        visual_features.append(feat)
+
+                    visual_features = torch.stack(visual_features)
+                    visual_features_flat = visual_features.view(visual_features.size(0), -1)
+
+                # 提取运动特征 (帧差异)
+                for i in range(1, len(frames)):
+                    curr_gray = cv2.cvtColor(frames[i], cv2.COLOR_RGB2GRAY)
+                    prev_gray = cv2.cvtColor(frames[i-1], cv2.COLOR_RGB2GRAY)
+
+                    # 计算光流
+                    try:
+                        flow = cv2.calcOpticalFlowFarneback(
+                            prev_gray, curr_gray, None,
+                            0.5, 3, 15, 3, 5, 1.2, 0
+                        )
+                        # 计算光流大小
+                        magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                        motion_score = np.mean(magnitude)
+                    except:
+                        # 如果光流计算失败，使用帧差异
+                        diff = np.abs(curr_gray.astype(float) - prev_gray.astype(float))
+                        motion_score = np.mean(diff)
+
+                    motion_features.append(motion_score)
+
+                # 为第一帧添加运动特征
+                motion_features.insert(0, motion_features[0] if motion_features else 0)
+                motion_features = torch.tensor(motion_features)
+
+                # 时序权重 - 关注视频中间部分
+                video_len = len(candidate_indices)
+                center = video_len // 2
+                temporal_weights = [1.0 - 0.8 * abs(i - center) / max(center, 1) for i in range(video_len)]
+                temporal_weights = torch.tensor(temporal_weights)
+
+                # 4. 融合多模态信息
+                # 计算视觉特征的注意力权重
+                visual_attention = self._compute_attention_weights(visual_features_flat)
+
+                # 归一化运动特征
+                if motion_features.max() > motion_features.min():
+                    motion_features = (motion_features - motion_features.min()) / (motion_features.max() - motion_features.min())
+
+                # 融合注意力权重（视觉特征权重、运动特征权重和时序权重）
+                # 根据实验调整权重
+                fusion_weights = visual_attention * 0.5 + motion_features * 0.3 + temporal_weights * 0.2
+
+                # 5. 进行多样性采样
+                selected_indices = self._diversity_sampling_multimodal(
+                    visual_features_flat,
+                    motion_features,
+                    fusion_weights,
+                    max_frames
+                )
+
+                # 将选择的索引映射回原始帧
+                final_indices = [candidate_indices[idx] for idx in selected_indices]
+
+                elapsed = time.time() - start_time
+                self.keyframe_time += elapsed
+                print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+                
+                # 写入统计信息到文件（使用文件锁确保并发安全）
+                try:
+                    with open(stats_file, 'a+') as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                        f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                        fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+                except Exception as e:
+                    print(f"无法写入统计信息: {e}")
+                
+                return sorted(final_indices)
+            except Exception as e:
+                print(f"多模态注意力关键帧检测失败: {str(e)}")
+                print("回退到普通注意力方法...")
+                elapsed = time.time() - start_time
+                self.keyframe_time += elapsed
+                return self.detect_keyframes(vr, max_frames, threshold, 'attention_based')
 
         # 其他现有的关键帧提取方法保持不变
         elif mode == 'hmdb51_optimized':
@@ -278,6 +477,19 @@ class VideoClsDataset(Dataset):
                     additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
                     keyframe_indices.extend(additional_indices)
 
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return sorted(keyframe_indices[:max_frames])
 
         elif mode == 'optical_flow':
@@ -311,6 +523,19 @@ class VideoClsDataset(Dataset):
                 if len(keyframe_indices) >= max_frames:
                     break
 
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return sorted(keyframe_indices[:max_frames])
 
         elif mode == 'scene_change':
@@ -348,6 +573,19 @@ class VideoClsDataset(Dataset):
                     additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
                     keyframe_indices.extend(additional_indices)
 
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return sorted(keyframe_indices[:max_frames])
 
         elif mode == 'content_aware':
@@ -404,9 +642,35 @@ class VideoClsDataset(Dataset):
                     additional_indices = remaining_indices[::step][:max_frames - len(keyframe_indices)]
                     keyframe_indices.extend(additional_indices)
 
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return sorted(keyframe_indices[:max_frames])
 
         elif mode == 'uniform':
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return list(np.linspace(0, length-1, max_frames).astype(int))
 
         elif mode == 'saliency_map':
@@ -434,11 +698,37 @@ class VideoClsDataset(Dataset):
                 if len(keyframe_indices) >= max_frames:
                     break
 
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return sorted(keyframe_indices[:max_frames])
 
         else:
+            elapsed = time.time() - start_time
+            self.keyframe_time += elapsed
+            print(f"关键帧提取完成 #{self.keyframe_extraction_count}, 模式: {mode}, 耗时: {elapsed:.6f}秒")
+            
+            # 写入统计信息到文件（使用文件锁确保并发安全）
+            try:
+                with open(stats_file, 'a+') as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)  # 获取排他锁
+                    f.write(f"{process_id},{elapsed},{mode},1\n")  # 格式: 进程ID,耗时,模式,计数
+                    fcntl.flock(f, fcntl.LOCK_UN)  # 释放锁
+            except Exception as e:
+                print(f"无法写入统计信息: {e}")
+            
             return list(np.linspace(0, length-1, max_frames).astype(int))
-
+            
     def __getitem__(self, index):
         if self.mode == 'train':
             args = self.args
@@ -615,12 +905,35 @@ class VideoClsDataset(Dataset):
         if self.mode == 'test':
             # 测试模式下，如果启用了关键帧且在评估状态，使用关键帧
             if use_keyframes and self.args.eval:
+                import os
+                process_id = os.getpid()
+                self.total_videos_processed += 1  # 记录处理的视频数
+                print(f"处理视频 #{self.total_videos_processed}: {fname}, 进程ID: {process_id}")
+                
+                # 创建统计目录
+                stats_dir = os.path.join('/tmp', 'keyframe_stats')
+                os.makedirs(stats_dir, exist_ok=True)
+                videos_file = os.path.join(stats_dir, 'videos_processed.txt')
+                
+                # 记录处理的视频数
+                try:
+                    import fcntl
+                    with open(videos_file, 'a+') as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                        f.write(f"{process_id},1\n")  # 进程ID,视频数
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                except Exception as e:
+                    print(f"无法写入视频统计信息: {e}")
+                
+                import time
+                keyframe_start = time.time()
                 all_index = self.detect_keyframes(
                     vr, 
                     max_frames=self.args.keyframe_max_frames,
                     threshold=self.args.keyframe_threshold,
                     mode=self.args.keyframe_mode
                 )
+                self.keyframe_time += time.time() - keyframe_start
                 
                 # 确保有足够的帧
                 if len(all_index) < self.clip_len:
@@ -655,12 +968,15 @@ class VideoClsDataset(Dataset):
 
         # 训练或验证模式下，如果启用了关键帧，也使用关键帧
         if use_keyframes:
+            import time
+            keyframe_start = time.time()
             all_index = self.detect_keyframes(
                 vr, 
                 max_frames=self.args.keyframe_max_frames,
                 threshold=self.args.keyframe_threshold,
                 mode=self.args.keyframe_mode
             )
+            self.keyframe_time += time.time() - keyframe_start
             
             # 确保有足够的帧
             if len(all_index) < self.clip_len:

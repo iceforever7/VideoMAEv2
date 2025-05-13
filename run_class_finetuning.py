@@ -247,7 +247,7 @@ def get_args():
     '--keyframe_mode',
     type=str,
     default=None,
-    choices=[None, 'hmdb51_optimized', 'optical_flow', 'scene_change', 'content_aware', 'uniform', 'saliency_map', 'attention_based'],
+    choices=[None, 'hmdb51_optimized', 'optical_flow', 'scene_change', 'content_aware', 'uniform', 'saliency_map', 'attention_based', 'multimodal_attention'],  # 添加新的模式
     help='Key frame extraction mode')
     parser.add_argument(
         '--keyframe_max_frames',
@@ -428,6 +428,61 @@ def get_args():
     return parser.parse_args(), ds_init
 
 
+def collect_keyframe_stats(reset=False):
+    """从临时文件中收集关键帧统计信息，并可选择性清空统计文件"""
+    import os
+
+    keyframe_time = 0.0
+    keyframe_count = 0
+    videos_processed = 0
+
+    stats_dir = os.path.join('/tmp', 'keyframe_stats')
+    stats_file = os.path.join(stats_dir, 'keyframe_stats.txt')
+    videos_file = os.path.join(stats_dir, 'videos_processed.txt')
+
+    # 读取关键帧提取统计
+    if os.path.exists(stats_file):
+        with open(stats_file, 'r') as f:
+            for line in f:
+                try:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 4:
+                        time_spent = float(parts[1])
+                        count = int(parts[3])
+                        keyframe_time += time_spent
+                        keyframe_count += count
+                except Exception as e:
+                    print(f"读取统计行出错: {line}, {e}")
+
+    # 读取处理视频数统计
+    if os.path.exists(videos_file):
+        with open(videos_file, 'r') as f:
+            for line in f:
+                try:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 2:
+                        count = int(parts[1])
+                        videos_processed += count
+                except Exception as e:
+                    print(f"读取视频统计行出错: {line}, {e}")
+
+    # 如果reset为True，则清空统计文件
+    if reset:
+        try:
+            if os.path.exists(stats_file):
+                os.remove(stats_file)
+            if os.path.exists(videos_file):
+                os.remove(videos_file)
+        except Exception as e:
+            print(f"清空关键帧统计文件失败: {e}")
+
+    return {
+        'keyframe_time': keyframe_time,
+        'keyframe_extraction_count': keyframe_count,
+        'total_videos_processed': videos_processed
+    }
+
+
 def main(args, ds_init):
     utils.init_distributed_mode(args)
 
@@ -477,6 +532,7 @@ def main(args, ds_init):
             shuffle=False)
     else:
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        sampler_test = torch.utils.data.SequentialSampler(dataset_test)
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -819,11 +875,24 @@ def main(args, ds_init):
 
     if args.eval:
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+        # ==== 推理统计开始 ====
+        infer_start_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         test_stats = final_test(data_loader_test, model, device, preds_file)
-        torch.distributed.barrier()
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        infer_end_time = time.time()
+        infer_total_time = infer_end_time - infer_start_time
+        max_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
+        # ==== 推理统计结束 ====
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         if global_rank == 0:
             print("Start merging results...")
+            merge_start_time = time.time()
             final_top1, final_top5 = merge(args.output_dir, num_tasks)
+            merge_end_time = time.time()
+            merge_time = merge_end_time - merge_start_time
             print(
                 f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
             )
@@ -834,6 +903,41 @@ def main(args, ds_init):
                         mode="a",
                         encoding="utf-8") as f:
                     f.write(json.dumps(log_stats) + "\n")
+            # ==== 关键帧提取时间统计 ====
+            keyframe_stats = collect_keyframe_stats()
+            keyframe_time = keyframe_stats['keyframe_time']
+            keyframe_extraction_count = keyframe_stats['keyframe_extraction_count']
+            total_videos_processed = keyframe_stats['total_videos_processed']
+            # ==== loss ====
+            test_loss = test_stats.get('loss', None)
+            # ==== 输出到模型+关键帧方法.txt ====
+            # ----------- 修改模型名为finetune文件名 -----------
+            if args.finetune and os.path.isfile(args.finetune):
+                model_name = os.path.splitext(os.path.basename(args.finetune))[0]
+            else:
+                model_name = args.model
+            keyframe_mode = args.keyframe_mode if args.keyframe_mode else "none"
+            result_file = os.path.join(args.output_dir, f"{model_name}+{keyframe_mode}.txt")
+            # ==== 记录推理测试总时间 ====
+            test_total_time = None
+            if 'test_total_start_time' in globals():
+                test_total_time = time.time() - test_total_start_time
+            with open(result_file, "w") as f:
+                f.write(f"模型: {model_name}\n")
+                f.write(f"关键帧方法: {keyframe_mode}\n")
+                f.write(f"推理总时间(s): {infer_total_time:.4f}\n")
+                f.write(f"显存消耗(GB): {max_mem:.4f}\n")
+                f.write(f"Top-1: {final_top1:.2f}%\n")
+                f.write(f"Top-5: {final_top5:.2f}%\n")
+                if test_loss is not None:
+                    f.write(f"Loss: {test_loss:.4f}\n")
+                f.write(f"关键帧提取总时间(s): {keyframe_time:.6f}\n")
+                f.write(f"关键帧提取调用次数: {keyframe_extraction_count}\n")
+                f.write(f"处理视频总数: {total_videos_processed}\n")
+                f.write(f"结果合并时间(s): {merge_time:.4f}\n")
+                # 新增：写入本次推理测试总耗时
+                if test_total_time is not None:
+                    f.write(f"本次推理测试总耗时(s): {test_total_time:.4f}\n")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
@@ -935,12 +1039,25 @@ def main(args, ds_init):
                 f.write(json.dumps(log_stats) + "\n")
 
     preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+    # ==== 推理统计开始 ====
+    infer_start_time = time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     test_stats = final_test(data_loader_test, model, device, preds_file)
-    torch.distributed.barrier()
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    infer_end_time = time.time()
+    infer_total_time = infer_end_time - infer_start_time
+    max_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0
+    # ==== 推理统计结束 ====
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     if global_rank == 0:
         print("Start merging results...")
+        merge_start_time = time.time()
         final_top1, final_top5 = merge(args.output_dir, num_tasks)
+        merge_end_time = time.time()
+        merge_time = merge_end_time - merge_start_time
         print(
             f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
         )
@@ -951,6 +1068,41 @@ def main(args, ds_init):
                     mode="a",
                     encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        # ==== 关键帧提取时间统计 ====
+        keyframe_stats = collect_keyframe_stats()
+        keyframe_time = keyframe_stats['keyframe_time'] 
+        keyframe_extraction_count = keyframe_stats['keyframe_extraction_count']
+        total_videos_processed = keyframe_stats['total_videos_processed']
+        # ==== loss ====
+        test_loss = test_stats.get('loss', None)
+        # ==== 输出到模型+关键帧方法.txt ====
+        # ----------- 修改模型名为finetune文件名 -----------
+        if args.finetune and os.path.isfile(args.finetune):
+            model_name = os.path.splitext(os.path.basename(args.finetune))[0]
+        else:
+            model_name = args.model
+        keyframe_mode = args.keyframe_mode if args.keyframe_mode else "none"
+        result_file = os.path.join(args.output_dir, f"{model_name}+{keyframe_mode}.txt")
+        # ==== 记录推理测试总时间 ====
+        test_total_time = None
+        if 'test_total_start_time' in globals():
+            test_total_time = time.time() - test_total_start_time
+        with open(result_file, "w") as f:
+            f.write(f"模型: {model_name}\n")
+            f.write(f"关键帧方法: {keyframe_mode}\n")
+            f.write(f"推理总时间(s): {infer_total_time:.4f}\n")
+            f.write(f"显存消耗(GB): {max_mem:.4f}\n")
+            f.write(f"Top-1: {final_top1:.2f}%\n")
+            f.write(f"Top-5: {final_top5:.2f}%\n")
+            if test_loss is not None:
+                f.write(f"Loss: {test_loss:.4f}\n")
+            f.write(f"关键帧提取总时间(s): {keyframe_time:.6f}\n")
+            f.write(f"关键帧提取调用次数: {keyframe_extraction_count}\n")
+            f.write(f"处理视频总数: {total_videos_processed}\n")
+            f.write(f"结果合并时间(s): {merge_time:.4f}\n")
+            # 新增：写入本次推理测试总耗时
+            if test_total_time is not None:
+                f.write(f"本次推理测试总耗时(s): {test_total_time:.4f}\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -961,4 +1113,9 @@ if __name__ == '__main__':
     opts, ds_init = get_args()
     if opts.output_dir:
         Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
+    # ==== 运行前清空关键帧统计 ====
+    collect_keyframe_stats(reset=True)
+    # ==== 记录推理测试总时间 ====
+    global test_total_start_time
+    test_total_start_time = time.time()
     main(opts, ds_init)

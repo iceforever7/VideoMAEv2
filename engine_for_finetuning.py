@@ -10,6 +10,7 @@ import os
 import sys
 from multiprocessing import Pool
 from typing import Iterable, Optional
+import re
 
 import numpy as np
 import torch
@@ -279,17 +280,25 @@ def merge(eval_path, num_tasks, method='prob'):
     dict_pos = {}
     print("Reading individual output files")
 
+    pattern = re.compile(r"^(.*?) \[(.*?)\] (\d+) (\d+) (\d+)$")
+
     for x in range(num_tasks):
         file = os.path.join(eval_path, str(x) + '.txt')
         lines = open(file, 'r').readlines()[1:]
         for line in lines:
             line = line.strip()
-            name = line.split('[')[0]
-            label = line.split(']')[1].split(' ')[1]
-            chunk_nb = line.split(']')[1].split(' ')[2]
-            split_nb = line.split(']')[1].split(' ')[3]
-            data = np.fromstring(
-                line.split('[')[1].split(']')[0], dtype=float, sep=',')
+            match = pattern.match(line)
+            if not match:
+                print(f"跳过异常行: {line[:50]}...")
+                continue
+            name = match.group(1)
+            data_str = match.group(2)
+            label = match.group(3)
+            chunk_nb = match.group(4)
+            split_nb = match.group(5)
+            data = np.fromstring(data_str, dtype=float, sep=',')
+            if data.size == 0:
+                continue  # 跳过空数组
             if name not in dict_feats:
                 dict_feats[name] = []
                 dict_label[name] = 0
@@ -308,11 +317,9 @@ def merge(eval_path, num_tasks, method='prob'):
     for i, item in enumerate(dict_feats):
         input_lst.append([i, item, dict_feats[item], dict_label[item]])
     p = Pool(64)
-    # [pred, top1, top5, label]
     ans = p.map(compute_video, input_lst)
     top1 = [x[1] for x in ans]
     top5 = [x[2] for x in ans]
-    label = [x[3] for x in ans]
     final_top1, final_top5 = np.mean(top1), np.mean(top5)
 
     return final_top1 * 100, final_top5 * 100
